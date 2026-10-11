@@ -262,13 +262,24 @@ async function loadData() {
   if (unsubOrders) unsubOrders();
   const oQuery = query(
     collection(db, 'orders'),
-    where('vendorId', '==', currentVendor.id),
-    orderBy('createdAt', 'desc')
+    where('vendorId', '==', currentVendor.id)
   );
-  unsubOrders = onSnapshot(oQuery, (snap) => {
-    orders = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    if (currentPage === 'dashboard' || currentPage === 'orders') renderPage();
-  });
+  unsubOrders = onSnapshot(
+    oQuery,
+    (snap) => {
+      orders = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      // Sort client-side to avoid needing a composite index
+      orders.sort((a, b) => {
+        const aTime = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(a.createdAt || 0);
+        const bTime = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(b.createdAt || 0);
+        return bTime - aTime;
+      });
+      if (currentPage === 'dashboard' || currentPage === 'orders') renderPage();
+    },
+    (error) => {
+      console.error('Orders listener error:', error);
+    }
+  );
 
   renderPage();
 }
