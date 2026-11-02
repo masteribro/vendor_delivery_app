@@ -1,4 +1,5 @@
 import { db, auth } from './firebase.js';
+import { searchPlaces, getPlaceDetails } from './places.js';
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
@@ -28,6 +29,65 @@ let products = [];
 let orders = [];
 let unsubOrders = null;
 let vendorStores = []; // all stores owned by this vendor account
+let knownOrderIds = new Set(); // track known orders for notifications
+let notifSound = null; // audio element for notification sound
+let notifEnabled = true; // user can toggle
+
+// ── Notification sound (Web Audio API) ──
+function playNotificationSound() {
+  if (!notifEnabled) return;
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    // Two-tone chime
+    [520, 660].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.3, ctx.currentTime + i * 0.15);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.15 + 0.4);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(ctx.currentTime + i * 0.15);
+      osc.stop(ctx.currentTime + i * 0.15 + 0.4);
+    });
+  } catch (e) {
+    // Audio not supported, skip silently
+  }
+}
+
+function showOrderNotification(order) {
+  const toast = document.createElement('div');
+  toast.className = 'toast-notification';
+  toast.innerHTML = `
+    <span class="material-icons">notifications_active</span>
+    <div>
+      <strong>New Order!</strong>
+      <p>${(order.items || []).length} items &middot; ${formatPrice(order.total)}</p>
+    </div>
+  `;
+  document.body.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('show'));
+  setTimeout(() => {
+    toast.classList.remove('show');
+    setTimeout(() => toast.remove(), 300);
+  }, 4000);
+
+  playNotificationSound();
+
+  // Browser notification if permitted
+  if (Notification.permission === 'granted') {
+    new Notification('New Order!', {
+      body: `${(order.items || []).length} items · ${formatPrice(order.total)}`,
+      icon: '🛒',
+    });
+  }
+}
+
+function requestNotifPermission() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
 
 // ── Auth state ──
 onAuthStateChanged(auth, async (user) => {
@@ -136,6 +196,63 @@ function renderLogin() {
   };
 }
 
+// ── Address autocomplete helper ──
+let debounceTimer = null;
+
+function setupAddressAutocomplete(inputId, dropdownId, onSelect) {
+  const input = document.getElementById(inputId);
+  const dropdown = document.getElementById(dropdownId);
+  if (!input || !dropdown) return;
+
+  let selectedPlace = null;
+
+  input.addEventListener('input', () => {
+    clearTimeout(debounceTimer);
+    selectedPlace = null;
+    const query = input.value.trim();
+    if (query.length < 3) {
+      dropdown.innerHTML = '';
+      dropdown.classList.remove('show');
+      return;
+    }
+    debounceTimer = setTimeout(async () => {
+      const results = await searchPlaces(query);
+      if (results.length === 0) {
+        dropdown.innerHTML = '';
+        dropdown.classList.remove('show');
+        return;
+      }
+      dropdown.innerHTML = results
+        .map((r) => `<div class="address-option" data-place-id="${r.placeId}">${r.description}</div>`)
+        .join('');
+      dropdown.classList.add('show');
+
+      dropdown.querySelectorAll('.address-option').forEach((opt) => {
+        opt.onclick = async () => {
+          const details = await getPlaceDetails(opt.dataset.placeId);
+          if (details) {
+            input.value = details.address;
+            selectedPlace = details;
+            if (onSelect) onSelect(details);
+          }
+          dropdown.innerHTML = '';
+          dropdown.classList.remove('show');
+        };
+      });
+    }, 400);
+  });
+
+  // Close dropdown when clicking outside
+  document.addEventListener('click', (e) => {
+    if (!input.contains(e.target) && !dropdown.contains(e.target)) {
+      dropdown.innerHTML = '';
+      dropdown.classList.remove('show');
+    }
+  });
+
+  return () => selectedPlace;
+}
+
 // ── Setup vendor profile (first time) ──
 function renderSetupVendor(user) {
   app.innerHTML = `
@@ -150,7 +267,11 @@ function renderSetupVendor(user) {
             <option>Restaurants</option><option>Fast Food</option><option>Groceries</option><option>Pharmacy</option><option>Bakery</option>
           </select>
         </div>
-        <div class="form-group"><label>Address</label><input id="v-addr" placeholder="Store address" /></div>
+        <div class="form-group address-autocomplete-wrapper">
+          <label>Address</label>
+          <input id="v-addr" placeholder="Start typing your store address..." autocomplete="off" />
+          <div class="address-dropdown" id="v-addr-dropdown"></div>
+        </div>
         <div class="form-group"><label>Delivery Fee</label><input id="v-fee" type="number" value="500" /></div>
         <div class="form-group"><label>Min Order</label><input id="v-min" type="number" value="1000" /></div>
         <div class="form-group"><label>Prep Time (minutes)</label><input id="v-prep" type="number" value="25" /></div>
@@ -159,9 +280,19 @@ function renderSetupVendor(user) {
       </div>
     </div>
   `;
+
+  let selectedLocation = { latitude: null, longitude: null };
+  setupAddressAutocomplete('v-addr', 'v-addr-dropdown', (details) => {
+    selectedLocation = { latitude: details.latitude, longitude: details.longitude };
+  });
+
   document.getElementById('setup-btn').onclick = async () => {
     const name = document.getElementById('v-name').value.trim();
-    if (!name) return;
+    const address = document.getElementById('v-addr').value.trim();
+    const errEl = document.getElementById('setup-error');
+    if (!name) { errEl.textContent = 'Please enter a store name.'; return; }
+    if (!address) { errEl.textContent = 'Please select an address from the dropdown.'; return; }
+    if (!selectedLocation.latitude) { errEl.textContent = 'Please select an address from the dropdown to set your location.'; return; }
     try {
       const vendorData = {
         name,
@@ -175,7 +306,9 @@ function renderSetupVendor(user) {
         deliveryFee: parseFloat(document.getElementById('v-fee').value) || 500,
         minOrder: parseFloat(document.getElementById('v-min').value) || 1000,
         isOpen: true,
-        address: document.getElementById('v-addr').value.trim(),
+        address,
+        latitude: selectedLocation.latitude,
+        longitude: selectedLocation.longitude,
         tags: [],
         ownerId: user.uid,
       };
@@ -183,7 +316,7 @@ function renderSetupVendor(user) {
       currentVendor = { id: ref.id, ...vendorData };
       renderDashboard();
     } catch (e) {
-      document.getElementById('setup-error').textContent = e.message;
+      errEl.textContent = e.message;
     }
   };
 }
@@ -209,9 +342,17 @@ function renderDashboard() {
           <a data-page="dashboard" class="active"><span class="material-icons">dashboard</span><span>Dashboard</span></a>
           <a data-page="orders"><span class="material-icons">receipt_long</span><span>Orders</span></a>
           <a data-page="products"><span class="material-icons">restaurant_menu</span><span>Products</span></a>
+          <a data-page="analytics"><span class="material-icons">bar_chart</span><span>Analytics</span></a>
           <a data-page="profile"><span class="material-icons">store</span><span>Profile</span></a>
           ${vendorStores.length > 1 ? '<a id="switch-store-btn"><span class="material-icons">swap_horiz</span><span>Switch Store</span></a>' : ''}
           <a id="logout-btn"><span class="material-icons">logout</span><span>Sign Out</span></a>
+        </div>
+        <div class="sidebar-notif">
+          <label class="toggle-switch">
+            <input type="checkbox" id="notif-toggle" ${notifEnabled ? 'checked' : ''} />
+            <div class="toggle-slider"></div>
+          </label>
+          <span>Sound</span>
         </div>
       </nav>
       <div class="main-content" id="page-content"></div>
@@ -244,10 +385,15 @@ function renderDashboard() {
     label.textContent = isOpen ? 'Store Open' : 'Store Closed';
   };
 
+  document.getElementById('notif-toggle').onchange = (e) => {
+    notifEnabled = e.target.checked;
+  };
+
   document.getElementById('modal-overlay').onclick = (e) => {
     if (e.target.id === 'modal-overlay') closeModal();
   };
 
+  requestNotifPermission();
   loadData();
 }
 
@@ -264,17 +410,30 @@ async function loadData() {
     collection(db, 'orders'),
     where('vendorId', '==', currentVendor.id)
   );
+  knownOrderIds = new Set();
   unsubOrders = onSnapshot(
     oQuery,
     (snap) => {
-      orders = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      const newOrders = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
       // Sort client-side to avoid needing a composite index
-      orders.sort((a, b) => {
+      newOrders.sort((a, b) => {
         const aTime = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(a.createdAt || 0);
         const bTime = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(b.createdAt || 0);
         return bTime - aTime;
       });
-      if (currentPage === 'dashboard' || currentPage === 'orders') renderPage();
+
+      // Detect newly added orders for notifications
+      if (knownOrderIds.size > 0) {
+        for (const o of newOrders) {
+          if (!knownOrderIds.has(o.id) && o.status === 'pending') {
+            showOrderNotification(o);
+          }
+        }
+      }
+      knownOrderIds = new Set(newOrders.map((o) => o.id));
+
+      orders = newOrders;
+      if (currentPage === 'dashboard' || currentPage === 'orders' || currentPage === 'analytics') renderPage();
     },
     (error) => {
       console.error('Orders listener error:', error);
@@ -291,6 +450,7 @@ function renderPage() {
     case 'dashboard': renderDashboardPage(content); break;
     case 'orders': renderOrdersPage(content); break;
     case 'products': renderProductsPage(content); break;
+    case 'analytics': renderAnalyticsPage(content); break;
     case 'profile': renderProfilePage(content); break;
   }
 }
@@ -336,13 +496,16 @@ function renderDashboardPage(el) {
       ${activeOrders.length === 0
         ? '<div class="empty-state"><span class="material-icons">inbox</span><p>No active orders</p></div>'
         : `<table>
-            <thead><tr><th>Order ID</th><th>Customer</th><th>Items</th><th>Total</th><th>Status</th><th>Action</th></tr></thead>
+            <thead><tr><th>Order ID</th><th>Customer</th><th>Items</th><th>Total</th><th>Service Fee</th><th>PIN</th><th>Rider</th><th>Status</th><th>Action</th></tr></thead>
             <tbody>${activeOrders.slice(0, 10).map((o) => `
               <tr>
                 <td>#${o.id.slice(-6)}</td>
                 <td>${o.deliveryAddress || 'N/A'}</td>
                 <td>${(o.items || []).length} items</td>
                 <td>${formatPrice(o.total)}</td>
+                <td>${formatPrice(o.serviceFee || 0)}</td>
+                <td>${o.deliveryPin || '-'}</td>
+                <td>${formatRiderInfo(o)}</td>
                 <td><span class="badge badge-${o.status}">${o.status}</span></td>
                 <td>${getOrderActions(o)}</td>
               </tr>
@@ -362,12 +525,15 @@ function renderOrdersPage(el) {
       ${orders.length === 0
         ? '<div class="empty-state"><span class="material-icons">receipt_long</span><p>No orders yet</p></div>'
         : `<table>
-            <thead><tr><th>Order ID</th><th>Items</th><th>Total</th><th>Status</th><th>Time</th><th>Action</th></tr></thead>
+            <thead><tr><th>Order ID</th><th>Items</th><th>Total</th><th>Service Fee</th><th>PIN</th><th>Rider</th><th>Status</th><th>Time</th><th>Action</th></tr></thead>
             <tbody>${orders.map((o) => `
               <tr>
                 <td>#${o.id.slice(-6)}</td>
                 <td>${(o.items || []).map((i) => `${i.name} x${i.quantity}`).join(', ')}</td>
                 <td>${formatPrice(o.total)}</td>
+                <td>${formatPrice(o.serviceFee || 0)}</td>
+                <td>${o.deliveryPin || '-'}</td>
+                <td>${formatRiderInfo(o)}</td>
                 <td><span class="badge badge-${o.status}">${o.status}</span></td>
                 <td>${formatTime(o.createdAt)}</td>
                 <td>${getOrderActions(o)}</td>
@@ -381,9 +547,15 @@ function renderOrdersPage(el) {
 }
 
 function getOrderActions(order) {
+  // Vendors can only advance orders up to 'ready'.
+  // 'picked_up' and 'delivered' are controlled by the rider app via PIN verification.
   const statusFlow = ['pending', 'confirmed', 'preparing', 'ready'];
   const idx = statusFlow.indexOf(order.status);
-  if (idx === -1) return '-';
+  if (idx === -1) {
+    if (order.status === 'picked_up') return '<span style="color:#6c5ce7;font-size:12px">Rider has picked up</span>';
+    if (order.status === 'delivered') return '<span style="color:#00b894;font-size:12px">Delivered</span>';
+    return '-';
+  }
   const next = idx < statusFlow.length - 1 ? statusFlow[idx + 1] : null;
   let html = '';
   if (next) {
@@ -517,6 +689,154 @@ function showProductModal(existing = null) {
   };
 }
 
+// ── Analytics page ──
+function renderAnalyticsPage(el) {
+  const now = new Date();
+  const completedOrders = orders.filter((o) => o.status === 'delivered');
+  const cancelledOrders = orders.filter((o) => o.status === 'cancelled');
+  const allNonCancelled = orders.filter((o) => o.status !== 'cancelled');
+
+  // Group orders by date for the last 7 days
+  const last7 = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const key = d.toDateString();
+    const label = d.toLocaleDateString('en-NG', { weekday: 'short', day: 'numeric' });
+    const dayOrders = allNonCancelled.filter((o) => {
+      if (!o.createdAt) return false;
+      const od = o.createdAt.toDate ? o.createdAt.toDate() : new Date(o.createdAt);
+      return od.toDateString() === key;
+    });
+    const revenue = dayOrders.reduce((sum, o) => sum + (o.total || 0), 0);
+    last7.push({ label, count: dayOrders.length, revenue });
+  }
+
+  // Monthly stats
+  const thisMonth = allNonCancelled.filter((o) => {
+    if (!o.createdAt) return false;
+    const d = o.createdAt.toDate ? o.createdAt.toDate() : new Date(o.createdAt);
+    return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+  });
+  const monthRevenue = thisMonth.reduce((sum, o) => sum + (o.total || 0), 0);
+  const monthServiceFees = thisMonth.reduce((sum, o) => sum + (o.serviceFee || 0), 0);
+
+  // All-time stats
+  const totalRevenue = allNonCancelled.reduce((sum, o) => sum + (o.total || 0), 0);
+  const totalServiceFees = allNonCancelled.reduce((sum, o) => sum + (o.serviceFee || 0), 0);
+  const avgOrderValue = allNonCancelled.length > 0 ? totalRevenue / allNonCancelled.length : 0;
+
+  // Top products
+  const productCounts = {};
+  allNonCancelled.forEach((o) => {
+    (o.items || []).forEach((item) => {
+      const key = item.name || 'Unknown';
+      if (!productCounts[key]) productCounts[key] = { name: key, qty: 0, revenue: 0 };
+      productCounts[key].qty += item.quantity || 1;
+      productCounts[key].revenue += (item.price || 0) * (item.quantity || 1);
+    });
+  });
+  const topProducts = Object.values(productCounts).sort((a, b) => b.qty - a.qty).slice(0, 5);
+
+  // Chart bar max
+  const maxRevenue = Math.max(...last7.map((d) => d.revenue), 1);
+
+  el.innerHTML = `
+    <div class="page-header"><h1>Revenue Analytics</h1></div>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="icon" style="background:#00b894"><span class="material-icons">account_balance_wallet</span></div>
+        <div class="label">Total Revenue</div>
+        <div class="value">${formatPrice(totalRevenue)}</div>
+      </div>
+      <div class="stat-card">
+        <div class="icon" style="background:#0984e3"><span class="material-icons">calendar_month</span></div>
+        <div class="label">This Month</div>
+        <div class="value">${formatPrice(monthRevenue)}</div>
+      </div>
+      <div class="stat-card">
+        <div class="icon" style="background:#6c5ce7"><span class="material-icons">shopping_cart</span></div>
+        <div class="label">Avg Order Value</div>
+        <div class="value">${formatPrice(avgOrderValue)}</div>
+      </div>
+      <div class="stat-card">
+        <div class="icon" style="background:#fdcb6e"><span class="material-icons">receipt</span></div>
+        <div class="label">Total Service Fees</div>
+        <div class="value">${formatPrice(totalServiceFees)}</div>
+      </div>
+    </div>
+
+    <div class="analytics-row">
+      <div class="card analytics-chart-card">
+        <div class="card-header"><h3>Last 7 Days Revenue</h3></div>
+        <div class="bar-chart">
+          ${last7.map((d) => `
+            <div class="bar-col">
+              <div class="bar-value">${formatPrice(d.revenue)}</div>
+              <div class="bar-track">
+                <div class="bar-fill" style="height:${Math.max((d.revenue / maxRevenue) * 100, 2)}%"></div>
+              </div>
+              <div class="bar-label">${d.label}</div>
+              <div class="bar-count">${d.count} orders</div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+
+      <div class="card analytics-side-card">
+        <div class="card-header"><h3>Top Products</h3></div>
+        ${topProducts.length === 0
+          ? '<div class="empty-state" style="padding:20px"><p>No data yet</p></div>'
+          : `<div class="top-products-list">
+              ${topProducts.map((p, i) => `
+                <div class="top-product-row">
+                  <span class="top-rank">#${i + 1}</span>
+                  <div class="top-product-info">
+                    <div class="top-product-name">${p.name}</div>
+                    <div class="top-product-meta">${p.qty} sold &middot; ${formatPrice(p.revenue)}</div>
+                  </div>
+                </div>
+              `).join('')}
+            </div>`
+        }
+      </div>
+    </div>
+
+    <div class="analytics-row">
+      <div class="card" style="flex:1">
+        <div class="card-header"><h3>Order Summary</h3></div>
+        <div class="order-summary-grid">
+          <div class="summary-item">
+            <div class="summary-num">${allNonCancelled.length}</div>
+            <div class="summary-label">Total Orders</div>
+          </div>
+          <div class="summary-item">
+            <div class="summary-num">${completedOrders.length}</div>
+            <div class="summary-label">Delivered</div>
+          </div>
+          <div class="summary-item">
+            <div class="summary-num">${cancelledOrders.length}</div>
+            <div class="summary-label">Cancelled</div>
+          </div>
+          <div class="summary-item">
+            <div class="summary-num">${allNonCancelled.length > 0 ? ((completedOrders.length / allNonCancelled.length) * 100).toFixed(1) : 0}%</div>
+            <div class="summary-label">Completion Rate</div>
+          </div>
+          <div class="summary-item">
+            <div class="summary-num">${thisMonth.length}</div>
+            <div class="summary-label">This Month Orders</div>
+          </div>
+          <div class="summary-item">
+            <div class="summary-num">${formatPrice(monthServiceFees)}</div>
+            <div class="summary-label">Month Service Fees</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 // ── Profile page ──
 function renderProfilePage(el) {
   const v = currentVendor;
@@ -532,7 +852,11 @@ function renderProfilePage(el) {
           ).join('')}
         </select>
       </div>
-      <div class="form-group"><label>Address</label><input id="pf-addr" value="${v.address || ''}" /></div>
+      <div class="form-group address-autocomplete-wrapper">
+        <label>Address</label>
+        <input id="pf-addr" value="${v.address || ''}" placeholder="Start typing your store address..." autocomplete="off" />
+        <div class="address-dropdown" id="pf-addr-dropdown"></div>
+      </div>
       <div class="form-group"><label>Delivery Fee</label><input id="pf-fee" type="number" value="${v.deliveryFee || 0}" /></div>
       <div class="form-group"><label>Min Order</label><input id="pf-min" type="number" value="${v.minOrder || 0}" /></div>
       <div class="form-group"><label>Prep Time (minutes)</label><input id="pf-prep" type="number" value="${v.prepTimeMinutes || 25}" /></div>
@@ -544,12 +868,19 @@ function renderProfilePage(el) {
     </div>
   `;
 
+  let profileLocation = { latitude: v.latitude || null, longitude: v.longitude || null };
+  setupAddressAutocomplete('pf-addr', 'pf-addr-dropdown', (details) => {
+    profileLocation = { latitude: details.latitude, longitude: details.longitude };
+  });
+
   document.getElementById('save-profile').onclick = async () => {
     const data = {
       name: document.getElementById('pf-name').value.trim(),
       description: document.getElementById('pf-desc').value.trim(),
       category: document.getElementById('pf-cat').value,
       address: document.getElementById('pf-addr').value.trim(),
+      latitude: profileLocation.latitude,
+      longitude: profileLocation.longitude,
       deliveryFee: parseFloat(document.getElementById('pf-fee').value) || 0,
       minOrder: parseFloat(document.getElementById('pf-min').value) || 0,
       prepTimeMinutes: parseInt(document.getElementById('pf-prep').value) || 25,
@@ -569,6 +900,11 @@ function renderProfilePage(el) {
 }
 
 // ── Helpers ──
+function formatRiderInfo(order) {
+  if (!order.riderName) return '<span style="color:#b2bec3">No rider yet</span>';
+  return `<div style="font-size:13px"><strong>${order.riderName}</strong><br><a href="tel:${order.riderPhone}" style="color:#0984e3">${order.riderPhone || ''}</a></div>`;
+}
+
 function formatPrice(amount) {
   return '\u20A6' + (amount || 0).toLocaleString();
 }
