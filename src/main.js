@@ -291,8 +291,6 @@ function renderSetupVendor(user) {
     const address = document.getElementById('v-addr').value.trim();
     const errEl = document.getElementById('setup-error');
     if (!name) { errEl.textContent = 'Please enter a store name.'; return; }
-    if (!address) { errEl.textContent = 'Please select an address from the dropdown.'; return; }
-    if (!selectedLocation.latitude) { errEl.textContent = 'Please select an address from the dropdown to set your location.'; return; }
     try {
       const vendorData = {
         name,
