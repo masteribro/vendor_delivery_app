@@ -26,7 +26,7 @@ const db = getFirestore(app);
 const auth = getAuth(app);
 
 async function seed() {
-  console.log('Seeding Kali Marketplace data...\n');
+  console.log('Seeding Afana Marketplace data...\n');
 
   // Create vendor account
   let vendorUid;

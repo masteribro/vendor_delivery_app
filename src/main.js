@@ -142,7 +142,7 @@ function renderLogin() {
   app.innerHTML = `
     <div class="login-container">
       <div class="login-card">
-        <h1>Kali Vendor</h1>
+        <h1>Afana Vendor</h1>
         <p>Sign in to manage your store</p>
         <div id="login-form">
           <div class="form-group">
@@ -325,7 +325,7 @@ function renderDashboard() {
     <div class="layout">
       <nav class="sidebar">
         <div class="sidebar-brand">
-          <h2>Kali Vendor</h2>
+          <h2>Afana Vendor</h2>
           <span>${currentVendor.name}</span>
         </div>
         <div class="store-status">
